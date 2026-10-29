@@ -107,6 +107,14 @@ int g_iAvgMoneyT, g_iAvgMoneyCT;
 float g_fWeaponPickupCooldown[MAXPLAYERS+1];
 float g_fNadeLineupCooldown[MAXPLAYERS+1];
 float g_fNadeArrivedTimestamp[MAXPLAYERS+1];
+// CPU 优化：算雷失败冷却 + 全服每 tick 算雷预算
+float g_fNextNadeSolve[MAXPLAYERS+1];
+int g_iLastNadeSolveTick = -1, g_iLastNadeSolveClient = -1, g_iNadeSolvesThisTick;
+#define NADE_SOLVE_FAIL_COOLDOWN 2.0
+// CPU 优化：骨骼索引缓存（按模型索引失效），避免每次瞄准都做字符串骨骼查找 SDKCall
+#define BONE_CACHE_SIZE 24
+int g_iBoneCache[MAXPLAYERS+1][BONE_CACHE_SIZE];
+int g_iBoneCacheModel[MAXPLAYERS+1];
 
 enum struct NadeLineup
 {
@@ -935,6 +943,16 @@ public void OnFreezetimeEnd(Event eEvent, const char[] szName, bool bDontBroadca
 	g_bFreezetimeEnd = true;
 	g_fFreezeTimeEnd = GetGameTime();
 	UpdateAliveTeamCounts();
+
+	// 错开本回合首次定点道具检索：避免全部 bot 在 freeze 结束后的同一 tick 集中执行 GetNearestGrenade
+	float fNow = GetGameTime();
+	for (int i = 1; i <= MaxClients; i++)
+	{
+		if (!IsValidClient(i) || !IsFakeClient(i) || !IsPlayerAlive(i))
+			continue;
+
+		g_fNadeLineupCooldown[i] = fNow + (i * 0.05);
+	}
 }
 
 public void OnBombPlanted(Event eEvent, const char[] szName, bool bDontBroadcast)
@@ -1499,7 +1517,8 @@ public Action OnPlayerRunCmd(int iClient, int &iButtons, int &iImpulse, float fV
 	{
 		bool bIsEnemyVisible = !!GetEntData(iClient, g_iEnemyVisibleOffset);
 
-		if (g_bBombPlanted && !bIsEnemyVisible && GetClientTeam(iClient) == CS_TEAM_T && IsEnemyNearBomb() && IsItMyChance(0.5))
+		// CPU 优化：先掷概率再遍历玩家，避免每 tick 都跑 IsEnemyNearBomb 循环
+		if (g_bBombPlanted && !bIsEnemyVisible && GetClientTeam(iClient) == CS_TEAM_T && IsItMyChance(0.5) && IsEnemyNearBomb())
 		{
 			float fClientEyes[3];
 			GetClientEyePosition(iClient, fClientEyes);
@@ -1642,7 +1661,8 @@ void ProcessCombat(int iClient, int &iButtons, float fVel[3], float fAngles[3], 
 		float fClientLoc[3];
 		Array_Copy(g_fBotOrigin[iClient], fClientLoc, 3);
 		fClientLoc[2] += HalfHumanHeight;
-		if (fNow >= g_fCrouchTimestamp[iClient] && !GetEntProp(g_iActiveWeapon[iClient], Prop_Data, "m_bInReload") && IsPointVisible(fClientLoc, g_fTargetPos[iClient]) && fOnTarget > fAimTolerance && fTargetDistance < 2000.0 && IsRifleOrHeavy(iDefIndex))
+		// CPU 优化：把射线检测 IsPointVisible 放到最后，廉价条件不满足时不做 Trace
+		if (fNow >= g_fCrouchTimestamp[iClient] && IsRifleOrHeavy(iDefIndex) && fOnTarget > fAimTolerance && fTargetDistance < 2000.0 && !GetEntProp(g_iActiveWeapon[iClient], Prop_Data, "m_bInReload") && IsPointVisible(fClientLoc, g_fTargetPos[iClient]))
 			iButtons |= IN_DUCK;
 
 		g_iPrevTarget[iClient] = g_iTarget[iClient];
@@ -1711,6 +1731,8 @@ public void OnClientDisconnect(int iClient)
 	g_iPrevTarget[iClient] = -1;
 	g_iDoingSmokeNum[iClient] = -1;
 	g_fNadeArrivedTimestamp[iClient] = 0.0;
+	g_fNextNadeSolve[iClient] = 0.0;
+	g_iBoneCacheModel[iClient] = -1;
 	g_iActiveWeapon[iClient] = -1;
 	g_fLookAngleMaxAccel[iClient] = 0.0;
 	g_fReactionTime[iClient] = 0.0;
@@ -1955,6 +1977,26 @@ public void LoadDetours()
 public int LookupBone(int iEntity, const char[] szName)
 {
 	return SDKCall(g_hLookupBone, iEntity, szName);
+}
+
+// 骨骼索引只取决于模型，模型不变时直接复用缓存（-2 表示未查询）
+int GetCachedBone(int iEntity, int iSlot, const char[] szName)
+{
+	if (iEntity < 1 || iEntity > MaxClients || iSlot < 0 || iSlot >= BONE_CACHE_SIZE)
+		return LookupBone(iEntity, szName);
+
+	int iModel = GetEntProp(iEntity, Prop_Send, "m_nModelIndex");
+	if (iModel != g_iBoneCacheModel[iEntity])
+	{
+		g_iBoneCacheModel[iEntity] = iModel;
+		for (int i = 0; i < BONE_CACHE_SIZE; i++)
+			g_iBoneCache[iEntity][i] = -2;
+	}
+
+	if (g_iBoneCache[iEntity][iSlot] == -2)
+		g_iBoneCache[iEntity][iSlot] = LookupBone(iEntity, szName);
+
+	return g_iBoneCache[iEntity][iSlot];
 }
 
 public void GetBonePosition(int iEntity, int iBone, float fOrigin[3], float fAngles[3])
@@ -2347,7 +2389,9 @@ public void FinishQuickSwitch(int iUserId)
 	if (!IsValidClient(iClient))
 		return;
 	
-	SwitchWeapon(iClient, GetPlayerWeaponSlot(iClient, CS_SLOT_PRIMARY));
+	int iWeapon = GetPlayerWeaponSlot(iClient, CS_SLOT_PRIMARY);
+	if (IsValidEntity(iWeapon))
+		SwitchWeapon(iClient, iWeapon);
 }
 
 public Action Timer_EnableSwitch(Handle hTimer, any iUserId)
@@ -2389,8 +2433,8 @@ public void SelectBestTargetPos(int iClient, float fTargetPos[3])
 	if (!IsValidClient(g_iTarget[iClient]) || !IsPlayerAlive(g_iTarget[iClient]))
 		return;
 
-	int iHeadBone = LookupBone(g_iTarget[iClient], "head_0");
-	int iSpineBone = LookupBone(g_iTarget[iClient], "spine_3");
+	int iHeadBone = GetCachedBone(g_iTarget[iClient], 0, "head_0");
+	int iSpineBone = GetCachedBone(g_iTarget[iClient], 1, "spine_3");
 	if (iHeadBone < 0 || iSpineBone < 0)
 		return;
 
@@ -2433,7 +2477,7 @@ public void SelectBestTargetPos(int iClient, float fTargetPos[3])
 		// Head wasn't visible, check other bones.
 		for (int b = 0; b < sizeof(g_szBoneNames); b++)
 		{
-			int iBone = LookupBone(g_iTarget[iClient], g_szBoneNames[b]);
+			int iBone = GetCachedBone(g_iTarget[iClient], b + 2, g_szBoneNames[b]);
 			if (iBone < 0)
 				continue;
 
@@ -2515,6 +2559,29 @@ stock bool ProcessGrenadeThrow(int iClient, float fTarget[3], int iGrenadeEnt = 
 	int iGrenadeSlot = iGrenadeEnt != -1 ? iGrenadeEnt : GetPlayerWeaponSlot(iClient, CS_SLOT_GRENADE);
 	if (!IsValidEntity(iGrenadeSlot))
 		return false;
+
+	// CPU 优化：一次 SolveGrenadeToss 约 25 次轨迹仿真、上千次 Hull Trace。
+	// 原逻辑只有"成功投掷"才进入 5s 冷却，算雷失败时没有任何冷却，
+	// 交火期间 SetLookAt 被高频调用（25% 概率触发），会反复满载算雷。
+	// 1) 每个 Bot 失败后冷却 2s；2) 全服同一 tick 只允许一个 Bot 算雷，削平峰值。
+	// 同一 Bot 在同一 tick 内的第二次调用（原声源点 || 当前声源点 的回退）放行，最多 2 次。
+	float fNow = GetGameTime();
+	int iTick = GetGameTickCount();
+	if (iTick == g_iLastNadeSolveTick)
+	{
+		if (g_iLastNadeSolveClient != iClient || g_iNadeSolvesThisTick >= 2)
+			return false;
+	}
+	else
+	{
+		if (fNow < g_fNextNadeSolve[iClient])
+			return false;
+		g_iLastNadeSolveTick = iTick;
+		g_iLastNadeSolveClient = iClient;
+		g_iNadeSolvesThisTick = 0;
+		g_fNextNadeSolve[iClient] = fNow + NADE_SOLVE_FAIL_COOLDOWN;
+	}
+	g_iNadeSolvesThisTick++;
 
 	int iNadeDefIndex = GetEntProp(iGrenadeSlot, Prop_Send, "m_iItemDefinitionIndex");
 

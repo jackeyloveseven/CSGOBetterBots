@@ -371,6 +371,9 @@ public void OnClientDisconnect(int client)
 
 public void OnPlayerRunCmdPost(int client, int buttons, int impulse, const float vel[3], const float angles[3], int weapon, int subtype, int cmdnum, int tickcount, int seed, const int mouse[2])
 {
+	if(client < 1 || client > MaxClients || !IsClientInGame(client))
+		return;
+
 	// Client isn't recording or recording is paused.
 	if(g_hRecording[client] == null || g_bRecordingPaused[client])
 		return;
@@ -485,6 +488,10 @@ public void OnPlayerRunCmdPost(int client, int buttons, int impulse, const float
 
 public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3], float angles[3], int &weapon, int &subtype, int &cmdnum, int &tickcount, int &seed, int mouse[2])
 {
+	// Guard: player arrays are MAXPLAYERS+1 long, never index them with a bogus client.
+	if(client < 1 || client > MaxClients)
+		return Plugin_Continue;
+
 	// Bot is mimicing something
 	if(g_hBotMimicsRecord[client] == null)
 		return Plugin_Continue;
